@@ -1,0 +1,17 @@
+AGENTS.md
+specs/
+.idea/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+env/
+
+ops_state/
+*.jsonl.tmp
+.DS_Store
