@@ -11,9 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from common.cmd import CommandResult, run_cmd
+from common.cmd import run_cmd
 from common.output import bad, emit_json, info, ok, warn
+from common.redact import redact_data, redact_text
 from common.state import resolve_state_dir
+from common.warnings import command_warning
 
 
 SHOW_FIELDS = [
@@ -113,7 +115,7 @@ def parse_ps_output(text: str) -> List[Dict[str, Any]]:
                 "ppid": parsed_ppid,
                 "user": user,
                 "comm": comm,
-                "args": args,
+                "args": redact_text(args),
             }
         )
     return processes
@@ -182,20 +184,8 @@ def extract_notable_logs(lines: Iterable[str]) -> List[Dict[str, str]]:
         lowered = line.lower()
         matched = next((word for word in NOTABLE_PATTERNS if word in lowered), None)
         if matched:
-            notable.append({"level": "WARN", "match": matched, "line": line})
+            notable.append({"level": "WARN", "match": matched, "line": redact_text(line)})
     return notable
-
-
-def command_warning(label: str, result: CommandResult) -> Optional[str]:
-    if result.missing:
-        return f"{label}: command not available"
-    if result.timed_out:
-        return f"{label}: command timed out"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        suffix = f": {detail[0]}" if detail else ""
-        return f"{label}: command failed with exit {result.returncode}{suffix}"
-    return None
 
 
 def read_proc_process(pid: int) -> Dict[str, Any]:
@@ -229,7 +219,7 @@ def read_proc_process(pid: int) -> Dict[str, Any]:
 
     try:
         raw_cmd = base.joinpath("cmdline").read_bytes()
-        data["command"] = raw_cmd.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        data["command"] = redact_text(raw_cmd.replace(b"\x00", b" ").decode("utf-8", "replace").strip())
     except OSError:
         data["command"] = ""
 
@@ -327,7 +317,7 @@ def read_deep_directives(paths: Iterable[str]) -> Dict[str, List[Dict[str, str]]
                 continue
             key, value = line.split("=", 1)
             if key in DEEP_DIRECTIVES:
-                found.setdefault(key, []).append({"path": path_text, "value": value})
+                found.setdefault(key, []).append({"path": path_text, "value": redact_text(value)})
     return found
 
 
@@ -420,7 +410,7 @@ def collect_service(service_arg: str, logs: int, deep: bool, state: Optional[str
     if deep:
         report["deep"] = {"unit_directives": read_deep_directives(unit_paths)}
 
-    return report
+    return redact_data(report)
 
 
 def dedupe(values: Iterable[str]) -> List[str]:

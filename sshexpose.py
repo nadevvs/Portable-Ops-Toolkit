@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from common.cmd import run_cmd
 from common.output import bad, emit_json, ok, warn
 from common.state import resolve_state_dir
+from common.warnings import command_warning
 from svcdep import parse_ss_output
 
 
@@ -68,6 +69,59 @@ def parse_sshd_config(text: str) -> Dict[str, Any]:
             else:
                 config[canonical] = value
     return config
+
+
+def load_sshd_config(root: Path = Path("/etc/ssh/sshd_config")) -> Dict[str, Any]:
+    text, warnings = read_sshd_config_tree(root)
+    config = parse_sshd_config(text)
+    if warnings:
+        config["_warnings"] = warnings
+    return config
+
+
+def read_sshd_config_tree(path: Path, seen: Optional[set] = None) -> Any:
+    seen = seen or set()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if str(resolved) in seen:
+        return "", []
+    seen.add(str(resolved))
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return "", [f"{path}: {exc}"]
+
+    output = []
+    warnings = []
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        try:
+            parts = shlex.split(stripped, comments=True)
+        except ValueError:
+            output.append(raw_line)
+            continue
+        if parts and parts[0].lower() == "include":
+            for pattern in parts[1:]:
+                include_pattern = pattern if pattern.startswith("/") else str(Path("/etc/ssh") / pattern)
+                matches = sorted(Path(match) for match in glob_paths(include_pattern))
+                if not matches:
+                    warnings.append(f"Include matched no files: {pattern}")
+                for match in matches:
+                    included_text, included_warnings = read_sshd_config_tree(match, seen)
+                    output.append(included_text)
+                    warnings.extend(included_warnings)
+            continue
+        output.append(raw_line)
+    return "\n".join(output), warnings
+
+
+def glob_paths(pattern: str) -> List[str]:
+    import glob
+
+    return glob.glob(pattern)
 
 
 def parse_sshd_T(text: str) -> Dict[str, str]:
@@ -144,10 +198,10 @@ def parse_auth_log(lines: Iterable[str]) -> Dict[str, Any]:
     for line in lines:
         if "Failed password" in line:
             failed += 1
-            user = extract_after(line, "for ")
+            user = extract_failed_user(line)
             ip = extract_ip(line)
             if user:
-                failed_users[user.split()[0]] += 1
+                failed_users[user] += 1
             if ip:
                 failed_ips[ip] += 1
         if "Accepted " in line:
@@ -171,26 +225,28 @@ def extract_ip(line: str) -> str:
     return match.group(1) if match else ""
 
 
-def extract_after(line: str, marker: str) -> str:
-    if marker not in line:
-        return ""
-    return line.split(marker, 1)[1]
+def extract_failed_user(line: str) -> str:
+    invalid = re.search(r"Failed password for invalid user (\S+)", line)
+    if invalid:
+        return invalid.group(1)
+    regular = re.search(r"Failed password for (\S+)", line)
+    return regular.group(1) if regular else ""
 
 
 def classify_findings(config: Dict[str, Any], listeners: List[Dict[str, Any]], keys: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     findings = []
-    root_login = get_setting(config, "permitrootlogin", "PermitRootLogin")
-    password_auth = get_setting(config, "passwordauthentication", "PasswordAuthentication")
-    empty_passwords = get_setting(config, "permitemptypasswords", "PermitEmptyPasswords")
+    root_login_yes = setting_has(config, "permitrootlogin", "PermitRootLogin", "yes")
+    password_auth_yes = setting_has(config, "passwordauthentication", "PasswordAuthentication", "yes")
+    empty_passwords_yes = setting_has(config, "permitemptypasswords", "PermitEmptyPasswords", "yes")
     max_auth = get_setting(config, "maxauthtries", "MaxAuthTries")
     exposed = any(item.get("exposure") == "all-interfaces" for item in listeners)
-    if root_login == "yes":
+    if root_login_yes:
         findings.append({"severity": "CRITICAL", "message": "PermitRootLogin yes"})
-    if empty_passwords == "yes":
+    if empty_passwords_yes:
         findings.append({"severity": "CRITICAL", "message": "PermitEmptyPasswords yes"})
-    if exposed and password_auth == "yes":
+    if exposed and password_auth_yes:
         findings.append({"severity": "CRITICAL", "message": "SSH listens on all interfaces with password authentication enabled"})
-    elif password_auth == "yes":
+    elif password_auth_yes:
         findings.append({"severity": "WARN", "message": "PasswordAuthentication yes"})
     if exposed and not (get_setting(config, "allowusers", "AllowUsers") or get_setting(config, "allowgroups", "AllowGroups")):
         findings.append({"severity": "WARN", "message": "No AllowUsers or AllowGroups on exposed SSH listener"})
@@ -206,12 +262,23 @@ def classify_findings(config: Dict[str, Any], listeners: List[Dict[str, Any]], k
             findings.append({"severity": "WARN", "message": "root has authorized SSH keys"})
     if config.get("_match_blocks_present"):
         findings.append({"severity": "INFO", "message": "Match blocks present; simple parser did not evaluate conditional config"})
+    for item in config.get("_warnings", []):
+        findings.append({"severity": "INFO", "message": item})
     return findings
 
 
 def get_setting(config: Dict[str, Any], lower_key: str, mixed_key: str) -> Any:
     value = config.get(lower_key, config.get(mixed_key, ""))
+    if isinstance(value, list):
+        return [item.lower() if isinstance(item, str) else item for item in value]
     return value.lower() if isinstance(value, str) else value
+
+
+def setting_has(config: Dict[str, Any], lower_key: str, mixed_key: str, expected: str) -> bool:
+    value = get_setting(config, lower_key, mixed_key)
+    if isinstance(value, list):
+        return expected in value
+    return value == expected
 
 
 def score_findings(findings: List[Dict[str, str]]) -> str:
@@ -257,11 +324,8 @@ def collect(logs: int = 100, include_users: bool = False, deep: bool = False, st
     else:
         config = {}
         config_source = "files"
-        for path in [Path("/etc/ssh/sshd_config")] + sorted(Path("/etc/ssh/sshd_config.d").glob("*.conf") if Path("/etc/ssh/sshd_config.d").exists() else []):
-            try:
-                config.update(parse_sshd_config(path.read_text(encoding="utf-8", errors="replace")))
-            except OSError as exc:
-                warnings.append(f"{path}: {exc}")
+        config = load_sshd_config()
+        warnings.extend(config.pop("_warnings", []))
     ss_result = run_cmd(["ss", "-tulpn"], timeout=5)
     listeners = parse_ss_listeners(ss_result.stdout) if ss_result.stdout else []
     key_entries = collect_users() if include_users else []
@@ -277,6 +341,9 @@ def collect(logs: int = 100, include_users: bool = False, deep: bool = False, st
             except OSError:
                 pass
     fail2ban = run_cmd(["fail2ban-client", "status", "sshd"], timeout=5)
+    fail2ban_warning = command_warning("fail2ban-client status sshd", fail2ban)
+    if fail2ban_warning and not fail2ban.missing:
+        warnings.append(fail2ban_warning)
     fail2ban_data = {"available": fail2ban.returncode != 127, "sshd": fail2ban.stdout.strip() if fail2ban.ok else ""}
     findings = classify_findings(config, listeners, key_entries)
     return {

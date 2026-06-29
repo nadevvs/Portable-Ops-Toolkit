@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from common.cmd import run_cmd
 from common.output import emit_json, warn
 from common.state import resolve_state_dir
+from common.systemd import parse_systemd_timers
+from common.warnings import command_warning
 
 
 SPECIAL_SCHEDULES = {
@@ -55,31 +57,6 @@ def parse_crontab(text: str, source: str, has_user_field: bool = True) -> List[D
 def is_env_assignment(line: str) -> bool:
     key, sep, _ = line.partition("=")
     return bool(sep and key.replace("_", "").isalnum() and " " not in key)
-
-
-def parse_systemd_timers(text: str) -> List[Dict[str, str]]:
-    timers = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("NEXT ") or line.startswith("- ") or " timer" in line.lower():
-            continue
-        parts = line.split()
-        timer_index = next((i for i, part in enumerate(parts) if part.endswith(".timer")), None)
-        if timer_index is None:
-            continue
-        unit = parts[timer_index]
-        activates = parts[timer_index + 1] if len(parts) > timer_index + 1 else ""
-        timers.append(
-            {
-                "unit": unit,
-                "next": " ".join(parts[:timer_index - 2]) if timer_index >= 2 else "",
-                "left": parts[timer_index - 2] if timer_index >= 2 else "",
-                "last": "",
-                "passed": parts[timer_index - 1] if timer_index >= 1 else "",
-                "activates": activates,
-            }
-        )
-    return timers
 
 
 def parse_unit_files(text: str) -> Dict[str, str]:
@@ -168,9 +145,15 @@ def collect(include_users: bool = False, suspicious_only: bool = False, state: O
         else:
             errors.append("current-user crontab not readable or crontab command missing")
 
-    timer_result = run_cmd(["systemctl", "list-timers", "--all", "--no-pager"], timeout=5)
+    timer_result = run_cmd(["systemctl", "list-timers", "--all", "--no-pager", "--no-legend"], timeout=5)
+    timer_warning = command_warning("systemctl list-timers", timer_result)
+    if timer_warning:
+        errors.append(timer_warning)
     timers = parse_systemd_timers(timer_result.stdout) if timer_result.stdout else []
     unit_result = run_cmd(["systemctl", "list-unit-files", "--type=timer", "--no-pager"], timeout=5)
+    unit_warning = command_warning("systemctl list-unit-files", unit_result)
+    if unit_warning:
+        errors.append(unit_warning)
     states = parse_unit_files(unit_result.stdout) if unit_result.stdout else {}
     for timer in timers:
         timer["state"] = states.get(timer["unit"], "unknown")

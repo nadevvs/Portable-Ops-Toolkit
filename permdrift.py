@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from common.output import bad, emit_json, ok, warn
-from common.state import ensure_state_dir
+from common.state import ensure_state_dir, resolve_state_dir
 
 
 EXAMPLE_CONFIG = """# path | mode | owner | group | type | note | optional
@@ -59,6 +59,13 @@ def parse_config(text: str) -> List[ExpectedPath]:
 
 def mode_text(mode: int) -> str:
     return oct(mode & 0o7777)[2:]
+
+
+def normalize_mode_text(value: Any) -> str:
+    try:
+        return oct(int(str(value), 8) & 0o7777)[2:]
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def type_text(mode: int) -> str:
@@ -119,8 +126,10 @@ def compare_expected_actual(expected: ExpectedPath, actual: Dict[str, Any]) -> D
         reasons.append("file missing" + (", marked optional" if expected.optional else ""))
         return result(expected, actual, severity, reasons)
     for key in ("type", "mode", "owner", "group"):
-        if str(actual.get(key)) != str(getattr(expected, key)):
-            reasons.append(f"{key} expected={getattr(expected, key)} actual={actual.get(key)}")
+        expected_value = normalize_mode_text(getattr(expected, key)) if key == "mode" else str(getattr(expected, key))
+        actual_value = normalize_mode_text(actual.get(key)) if key == "mode" else str(actual.get(key))
+        if actual_value != expected_value:
+            reasons.append(f"{key} expected={expected_value} actual={actual_value}")
             severity = "WARN"
     critical_reason = classify_issue(expected, actual)
     if critical_reason:
@@ -131,11 +140,14 @@ def compare_expected_actual(expected: ExpectedPath, actual: Dict[str, Any]) -> D
 
 def classify_issue(expected: ExpectedPath, actual: Dict[str, Any]) -> str:
     path = expected.path.lower()
-    mode = int(str(actual.get("mode", "0")), 8)
-    expected_mode = int(str(expected.mode), 8)
+    try:
+        mode = int(str(actual.get("mode", "0")), 8)
+        expected_mode = int(str(expected.mode), 8)
+    except ValueError:
+        return "invalid mode value"
     if actual.get("world_writable") and not (expected_mode & 0o002):
         return "world-writable path"
-    if actual.get("setuid") and not expected.mode.startswith("4"):
+    if actual.get("setuid") and not (expected_mode & stat.S_ISUID):
         return "unexpected setuid bit"
     if expected.type == "file" and actual.get("type") == "symlink":
         return "file type changed from file to symlink"
@@ -193,7 +205,7 @@ def snapshot(config: str, state: Optional[str]) -> Dict[str, Any]:
 
 
 def diff_snapshot(config: str, state: Optional[str]) -> Dict[str, Any]:
-    state_dir = ensure_state_dir(state) / "permdrift"
+    state_dir = resolve_state_dir(state) / "permdrift"
     path = state_dir / "snapshot.json"
     try:
         previous = json.loads(path.read_text(encoding="utf-8"))
@@ -203,9 +215,17 @@ def diff_snapshot(config: str, state: Optional[str]) -> Dict[str, Any]:
     changes = []
     for entry in load_entries(config):
         current = get_file_metadata(entry.path)
-        if current != old.get(entry.path):
-            changes.append({"path": entry.path, "before": old.get(entry.path), "after": current})
+        previous = old.get(entry.path)
+        if permission_identity(current) != permission_identity(previous):
+            changes.append({"path": entry.path, "before": previous, "after": current})
     return {"snapshot": str(path), "changes": changes}
+
+
+def permission_identity(item: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not item:
+        return {}
+    keys = ("exists", "type", "mode", "owner", "group", "target", "world_writable", "setuid", "setgid")
+    return {key: item.get(key) for key in keys if key in item}
 
 
 def print_check(report: Dict[str, Any], no_color: bool = False) -> None:

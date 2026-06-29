@@ -2,9 +2,12 @@
 """One-command practical server overview."""
 
 import argparse
+import grp
 import os
 import platform
+import pwd
 import socket
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -12,8 +15,11 @@ from blackbox import parse_df, parse_meminfo
 from common.cmd import run_cmd
 from common.detect import read_os_release
 from common.output import bad, emit_json, ok, warn
+from common.redact import redact_text
 from common.state import resolve_state_dir
-from sshexpose import parse_auth_log, parse_sshd_config
+from common.systemd import parse_failed_units
+from common.warnings import command_warning
+from sshexpose import get_setting, load_sshd_config, parse_auth_log, parse_sshd_T
 from svcdep import parse_ss_output
 
 
@@ -58,12 +64,12 @@ def collect_disk() -> List[Dict[str, Any]]:
 
 def collect_failed_services() -> Dict[str, Any]:
     result = run_cmd(["systemctl", "--failed", "--no-pager"], timeout=5)
-    units = []
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if parts and "." in parts[0] and not parts[0].startswith("UNIT"):
-            units.append(parts[0])
-    return {"failed_units": units, "available": not result.missing}
+    warning = command_warning("systemctl --failed", result)
+    return {
+        "failed_units": parse_failed_units(result.stdout) if result.stdout else [],
+        "available": not result.missing,
+        "warning": warning or "",
+    }
 
 
 def classify_listener(port: Dict[str, Any]) -> str:
@@ -87,7 +93,7 @@ def collect_listeners() -> List[Dict[str, Any]]:
 
 def collect_recent_log_summary() -> Dict[str, Any]:
     result = run_cmd(["journalctl", "-p", "warning..alert", "-n", "50", "--no-pager"], timeout=5)
-    lines = result.stdout.splitlines() if result.stdout else []
+    lines = [redact_text(line) for line in result.stdout.splitlines()] if result.stdout else []
     lowered = "\n".join(lines).lower()
     return {
         "recent_warnings": len(lines),
@@ -102,11 +108,11 @@ def collect_ssh_quick(listeners: List[Dict[str, Any]]) -> Dict[str, Any]:
     active = run_cmd(["systemctl", "is-active", "ssh.service"], timeout=3)
     if not active.stdout.strip():
         active = run_cmd(["systemctl", "is-active", "sshd.service"], timeout=3)
-    config = {}
-    try:
-        config = parse_sshd_config(Path("/etc/ssh/sshd_config").read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        pass
+    sshd_t = run_cmd(["sshd", "-T"], timeout=5)
+    if sshd_t.ok:
+        config = parse_sshd_T(sshd_t.stdout)
+    else:
+        config = load_sshd_config()
     auth_lines = []
     for path in (Path("/var/log/auth.log"), Path("/var/log/secure")):
         try:
@@ -116,8 +122,8 @@ def collect_ssh_quick(listeners: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "active": active.stdout.strip() or "unknown",
         "listeners": [item for item in listeners if (item.get("process") or "").lower() == "sshd" or item.get("port") == "22"],
-        "password_auth": config.get("PasswordAuthentication", "unknown"),
-        "root_login": config.get("PermitRootLogin", "unknown"),
+        "password_auth": get_setting(config, "passwordauthentication", "PasswordAuthentication") or "unknown",
+        "root_login": get_setting(config, "permitrootlogin", "PermitRootLogin") or "unknown",
         "auth_log_summary": parse_auth_log(auth_lines),
     }
 
@@ -135,6 +141,8 @@ def parse_config(path: Optional[str]) -> Dict[str, List[str]]:
         if not stripped or stripped.startswith("#") or ":" not in stripped:
             continue
         kind, value = stripped.split(":", 1)
+        kind = kind.strip()
+        value = value.strip()
         if kind == "path":
             config["paths"].append(value)
         elif kind == "service":
@@ -142,6 +150,52 @@ def parse_config(path: Optional[str]) -> Dict[str, List[str]]:
         elif kind == "url":
             config["urls"].append(value)
     return config
+
+
+def path_metadata(path_text: str) -> Dict[str, Any]:
+    path = Path(path_text)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {"path": path_text, "exists": False}
+    except OSError as exc:
+        return {"path": path_text, "exists": False, "error": str(exc)}
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = str(st.st_uid)
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = str(st.st_gid)
+    return {
+        "path": path_text,
+        "exists": True,
+        "mode": oct(stat.S_IMODE(st.st_mode))[2:],
+        "owner": owner,
+        "group": group,
+    }
+
+
+def collect_config_checks(config: Dict[str, List[str]]) -> Dict[str, Any]:
+    services = []
+    for service in config.get("services", []):
+        active = run_cmd(["systemctl", "is-active", service], timeout=3)
+        services.append(
+            {
+                "service": service,
+                "active": active.stdout.strip() or "unknown",
+                "warning": command_warning(f"systemctl is-active {service}", active) or "",
+            }
+        )
+    return {
+        "paths": [path_metadata(path) for path in config.get("paths", [])],
+        "services": services,
+        "urls": [
+            {"url": url, "checked": False, "reason": "network URL checks are disabled by design"}
+            for url in config.get("urls", [])
+        ],
+    }
 
 
 def collect_network_basics() -> Dict[str, Any]:
@@ -168,6 +222,12 @@ def classify_findings(data: Dict[str, Any]) -> List[Dict[str, str]]:
             findings.append({"severity": "WARN", "message": f"{disk['mount']} disk usage {used}%"})
     for unit in data.get("services", {}).get("failed_units", []):
         findings.append({"severity": "WARN", "message": f"{unit} is failed"})
+    for item in data.get("config_checks", {}).get("paths", []):
+        if not item.get("exists"):
+            findings.append({"severity": "WARN", "message": f"configured path missing: {item['path']}"})
+    for item in data.get("config_checks", {}).get("services", []):
+        if item.get("active") not in {"active", "unknown"}:
+            findings.append({"severity": "WARN", "message": f"configured service inactive: {item['service']} ({item['active']})"})
     for listener in data.get("listeners", []):
         if listener.get("exposure") == "all-interfaces" and listener.get("port") in RISKY_PORTS:
             findings.append({"severity": "CRITICAL", "message": f"{RISKY_PORTS[listener['port']]} listens on all interfaces"})
@@ -222,6 +282,7 @@ def collect(config_path: Optional[str] = None, checks: Optional[str] = None, dee
     if "network" in wanted:
         data["network"] = collect_network_basics()
     data["config"] = parse_config(config_path)
+    data["config_checks"] = collect_config_checks(data["config"])
     findings = classify_findings(data)
     data["findings"] = findings
     data["overall"] = overall_status(findings)

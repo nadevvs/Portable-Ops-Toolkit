@@ -11,17 +11,25 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from common.cmd import run_cmd
 from common.output import emit_json
-from common.state import ensure_state_dir
+from common.redact import redact_text
+from common.state import ensure_state_dir, resolve_state_dir
+from common.systemd import parse_failed_units
+from common.warnings import command_warning
 
 
 def parse_loadavg(text: str) -> Dict[str, Any]:
     parts = text.split()
     data: Dict[str, Any] = {}
-    if len(parts) >= 3:
-        data.update({"load1": float(parts[0]), "load5": float(parts[1]), "load15": float(parts[2])})
-    if len(parts) >= 4 and "/" in parts[3]:
-        running, total = parts[3].split("/", 1)
-        data.update({"running_processes": int(running), "total_processes": int(total)})
+    try:
+        if text.strip() and len(parts) < 3:
+            raise ValueError
+        if len(parts) >= 3:
+            data.update({"load1": float(parts[0]), "load5": float(parts[1]), "load15": float(parts[2])})
+        if len(parts) >= 4 and "/" in parts[3]:
+            running, total = parts[3].split("/", 1)
+            data.update({"running_processes": int(running), "total_processes": int(total)})
+    except ValueError:
+        data["parse_error"] = "invalid /proc/loadavg format"
     return data
 
 
@@ -84,7 +92,7 @@ def parse_ps(text: str) -> Dict[str, List[Dict[str, Any]]]:
                 "cpu": float_or_zero(parts[4]),
                 "mem": float_or_zero(parts[5]),
                 "rss": int(parts[6]) if parts[6].isdigit() else 0,
-                "args": parts[7][:160],
+                "args": redact_text(parts[7][:160]),
             }
         )
     return {
@@ -98,15 +106,6 @@ def float_or_zero(value: str) -> float:
         return float(value)
     except ValueError:
         return 0.0
-
-
-def parse_failed_units(text: str) -> List[str]:
-    units = []
-    for line in text.splitlines():
-        parts = line.split()
-        if parts and parts[0].endswith(".service"):
-            units.append(parts[0])
-    return units
 
 
 def parse_ss_summary(text: str) -> Dict[str, Any]:
@@ -135,7 +134,7 @@ def parse_ss_summary(text: str) -> Dict[str, Any]:
 
 def notable_kernel(lines: Iterable[str]) -> List[str]:
     needles = ("oom", "killed process", "i/o error", "thermal", "segfault", "blocked for more than", "filesystem error")
-    return [line for line in lines if any(needle in line.lower() for needle in needles)][:5]
+    return [redact_text(line) for line in lines if any(needle in line.lower() for needle in needles)][:5]
 
 
 def read_text(path: str) -> str:
@@ -146,6 +145,8 @@ def read_text(path: str) -> str:
 
 
 def collect_snapshot() -> Dict[str, Any]:
+    uptime_text = read_text("/proc/uptime")
+    warnings = []
     load = parse_loadavg(read_text("/proc/loadavg"))
     mem = parse_meminfo(read_text("/proc/meminfo"))
     df = run_cmd(["df", "-P"], timeout=5)
@@ -153,10 +154,20 @@ def collect_snapshot() -> Dict[str, Any]:
     failed = run_cmd(["systemctl", "--failed", "--no-pager"], timeout=5)
     ss = run_cmd(["ss", "-tuna"], timeout=5)
     journal = run_cmd(["journalctl", "-k", "-n", "30", "--no-pager"], timeout=5)
+    for label, result in (
+        ("df", df),
+        ("ps", ps),
+        ("systemctl --failed", failed),
+        ("ss", ss),
+        ("journalctl -k", journal),
+    ):
+        warning = command_warning(label, result)
+        if warning:
+            warnings.append(warning)
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "hostname": socket.gethostname(),
-        "uptime_seconds": float_or_zero(read_text("/proc/uptime").split()[0]) if read_text("/proc/uptime") else 0,
+        "uptime_seconds": float_or_zero(uptime_text.split()[0]) if uptime_text else 0,
         "boot_id": read_text("/proc/sys/kernel/random/boot_id").strip(),
         "load": load,
         "memory": mem,
@@ -165,18 +176,20 @@ def collect_snapshot() -> Dict[str, Any]:
         "services": {"failed_units": parse_failed_units(failed.stdout) if failed.stdout else []},
         "network": parse_ss_summary(ss.stdout) if ss.stdout else {"tcp_listen": 0, "tcp_established": 0, "udp": 0, "top_remote_ips": []},
         "kernel": {"notable": notable_kernel(journal.stdout.splitlines() if journal.stdout else [])},
+        "warnings": warnings,
     }
 
 
-def paths(state: Optional[str]) -> Dict[str, Path]:
-    base = ensure_state_dir(state) / "blackbox"
-    base.mkdir(parents=True, exist_ok=True)
+def paths(state: Optional[str], create: bool = False) -> Dict[str, Path]:
+    base = (ensure_state_dir(state) if create else resolve_state_dir(state)) / "blackbox"
+    if create:
+        base.mkdir(parents=True, exist_ok=True)
     return {"dir": base, "snapshots": base / "snapshots.jsonl", "metadata": base / "metadata.json"}
 
 
 def record(state: Optional[str]) -> Dict[str, Any]:
     snapshot = collect_snapshot()
-    p = paths(state)
+    p = paths(state, create=True)
     with p["snapshots"].open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
     p["metadata"].write_text(json.dumps({"last_record": snapshot["timestamp"]}, indent=2), encoding="utf-8")
@@ -184,7 +197,7 @@ def record(state: Optional[str]) -> Dict[str, Any]:
 
 
 def read_snapshots(state: Optional[str]) -> List[Dict[str, Any]]:
-    path = paths(state)["snapshots"]
+    path = paths(state, create=False)["snapshots"]
     snapshots = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -237,7 +250,9 @@ def prune(state: Optional[str], days: int) -> Dict[str, Any]:
             kept.append(item)
         else:
             removed += 1
-    path = paths(state)["snapshots"]
+    path = paths(state, create=False)["snapshots"]
+    if not path.exists():
+        return {"kept": 0, "removed": 0, "message": f"snapshot not found: {path}"}
     tmp = path.with_suffix(".jsonl.tmp")
     tmp.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in kept), encoding="utf-8")
     tmp.replace(path)
@@ -264,8 +279,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_flags(sub.add_parser("tail"), suppress=True)
     prune_parser = sub.add_parser("prune")
     add_common_flags(prune_parser, suppress=True)
-    prune_parser.add_argument("--days", type=int, required=True)
+    prune_parser.add_argument("--days", type=positive_int, required=True)
     return parser
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def add_common_flags(parser: argparse.ArgumentParser, suppress: bool = False) -> None:
