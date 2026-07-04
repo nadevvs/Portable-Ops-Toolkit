@@ -1,5 +1,7 @@
 AGENTS.md
-specs/
+specs/*
+!specs/
+!specs/*.md
 .idea/
 
 __pycache__/

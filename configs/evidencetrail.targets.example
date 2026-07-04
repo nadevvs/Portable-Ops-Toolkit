@@ -1,0 +1,4 @@
+# One path per line. Existing files are hashed; directories are expanded.
+/etc/ssh/sshd_config
+/etc/passwd
+/var/log/auth.log

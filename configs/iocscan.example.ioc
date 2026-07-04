@@ -1,0 +1,8 @@
+# Exact-match offline IOC examples.
+# Supported prefixes: sha256:, path:, domain:, ip:, text:
+
+sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+path: /tmp/suspicious.sh
+domain: example-c2.invalid
+ip: 203.0.113.10
+text: /dev/tcp/
